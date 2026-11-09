@@ -1,4 +1,8 @@
 import io
+import json
+import time
+import urllib.error
+import urllib.request
 import torch
 import numpy as np
 import boto3
@@ -61,6 +65,65 @@ class SaveImageToS3:
             awss3_save_file(client, s3_bucket, "%s_%i.jpeg"%(pathname, batch_number), img_byte_arr)
             results.append({
                 "filename": "%s_%i.jpeg"%(pathname, batch_number),
+                "subfolder": "",
+                "type": "output"
+            })
+        return { "ui": { "images": results } }
+
+# SaveImageToPresignedUrl
+def put_with_retries(url, data, content_type, retries=3, timeout=120):
+    last_err = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, data=data, method="PUT", headers={"Content-Type": content_type})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status < 300:
+                    return
+                last_err = RuntimeError("upload failed with HTTP %s" % resp.status)
+        except urllib.error.HTTPError as e:
+            last_err = RuntimeError("upload failed with HTTP %s" % e.code)
+            if e.code < 500 and e.code not in (408, 429):
+                break
+        except Exception as e:
+            last_err = e
+        time.sleep(2 ** attempt)
+    raise RuntimeError("Save Image To Presigned URL: %s" % last_err)
+
+
+def parse_upload_urls(upload_urls):
+    value = upload_urls.strip()
+    if value.startswith("["):
+        urls = json.loads(value)
+    else:
+        urls = [value]
+    return [u for u in urls if isinstance(u, str) and u]
+
+
+class SaveImageToPresignedUrl:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"images": ("IMAGE",),
+                             "upload_urls": ("STRING", {"multiline": True, "default": ""}),
+                             },
+                }
+    RETURN_TYPES = ()
+    FUNCTION = "save_image_to_presigned_url"
+    CATEGORY = "image"
+    OUTPUT_NODE = True
+
+    def save_image_to_presigned_url(self, images, upload_urls):
+        urls = parse_upload_urls(upload_urls)
+        if len(urls) < len(images):
+            raise ValueError("Got %d images but only %d upload URLs" % (len(images), len(urls)))
+        results = list()
+        for (batch_number, image) in enumerate(images):
+            i = 255. * image.cpu().numpy()
+            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+            img_byte_arr = io.BytesIO()
+            img.save(img_byte_arr, format='JPEG')
+            put_with_retries(urls[batch_number], img_byte_arr.getvalue(), "image/jpeg")
+            results.append({
+                "filename": "%s_%i.jpeg" % ("presigned", batch_number),
                 "subfolder": "",
                 "type": "output"
             })
